@@ -3,38 +3,98 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>1F 부재 위치 맵</title>
+  <title>층별 도면 - 부재 위치 맵</title>
 
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+  <!-- Leaflet CDN -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    defer
+  ></script>
 
   <style>
     html, body { height: 100%; margin: 0; }
     #map { height: 100%; width: 100%; }
+
     .hint {
       position: absolute; z-index: 9999; left: 10px; top: 10px;
-      background: rgba(255,255,255,0.9); padding: 8px 10px; border-radius: 8px;
+      background: rgba(255,255,255,0.92); padding: 8px 10px; border-radius: 8px;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
       font-size: 14px;
       box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      line-height: 1.25;
+    }
+
+    .searchbox{
+      position:absolute; z-index:9999; left:10px; top:70px;
+      display:flex; gap:6px; align-items:center;
+      background: rgba(255,255,255,0.92); padding:8px 10px; border-radius:8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    .searchbox input{
+      width: 180px; padding: 6px 8px; border:1px solid #ccc; border-radius:6px;
+      outline: none;
+    }
+    .searchbox button{
+      padding: 6px 10px; border:1px solid #ccc; border-radius:6px; background:#fff;
+      cursor:pointer;
+    }
+
+    .floorbar{
+      position:absolute; z-index:9999; left:10px; top:122px;
+      display:flex; flex-wrap:wrap; gap:6px;
+      background: rgba(255,255,255,0.92); padding:8px 10px; border-radius:8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      max-width: calc(100vw - 40px);
+    }
+    .floorbar button{
+      padding: 6px 10px; border:1px solid #ccc; border-radius:999px; background:#fff; cursor:pointer;
+      white-space: nowrap;
+    }
+    .floorbar button.active{
+      border-color:#333;
+      font-weight:600;
+    }
+
+    /* 모바일에서 UI가 너무 커지지 않게 */
+    @media (max-width: 480px){
+      .searchbox input{ width: 140px; }
+      .hint{ font-size: 13px; }
     }
   </style>
 </head>
+
 <body>
   <div class="hint">
-    도면을 드래그/확대 가능<br/>
-    도면 클릭 시 좌표가 콘솔에 출력됩니다.
+    📌 도면 드래그/확대 가능<br/>
+    🔎 부재번호 검색 (예: B12) → 위치로 이동<br/>
+    (디버그) 도면 클릭 시 좌표가 콘솔에 출력됩니다.
   </div>
+
+  <!-- 검색 UI -->
+  <div class="searchbox">
+    <input id="beamSearch" type="text" placeholder="부재번호 검색 (예: B12)" />
+    <button id="beamSearchBtn">찾기</button>
+    <button id="beamClearBtn">초기화</button>
+  </div>
+
+  <!-- 층/동 선택 UI -->
+  <div class="floorbar">
+    <button data-plan="B1F_A">B1F-A동</button>
+    <button data-plan="B1F_B">B1F-B동</button>
+    <button data-plan="1F_A">1F-A동</button>
+    <button data-plan="1F_B">1F-B동</button>
+  </div>
+
   <div id="map"></div>
 
   <script>
     window.addEventListener("load", () => {
-      const imageUrl = "floor_1f.png";
-
-      // ✅ 도면 이미지 실제 픽셀 크기(아래 4)에서 자동 확인)
-      const IMAGE_WIDTH = 1231;
-      const IMAGE_HEIGHT = 740;
-
+      // 지도(도면) 초기화
       const map = L.map("map", {
         crs: L.CRS.Simple,
         minZoom: -2,
@@ -43,26 +103,130 @@
         zoomDelta: 0.25
       });
 
-      const bounds = [[0, 0], [IMAGE_HEIGHT, IMAGE_WIDTH]];
-      L.imageOverlay(imageUrl, bounds).addTo(map);
-      map.fitBounds(bounds);
+      // 도면 오버레이/마커 레이어를 교체 가능하게 관리
+      let overlay = null;
+      const markerLayer = L.layerGroup().addTo(map);
+      let markerById = new Map();
+      let bounds = null;
 
-      const beams = [
-        { id: "B12", x: 820, y: 520, status: "출하완료" },
-        { id: "B13", x: 910, y: 540, status: "미출하" },
-        { id: "G07", x: 320, y: 260, status: "출하완료" },
-      ];
+      /**
+       * ✅ 플랜(층-동) 정의
+       * - imageUrl: GitHub에 올린 도면 이미지 파일명
+       * - width/height: 해당 이미지 실제 픽셀 크기
+       * - beams: {id, x, y, status} 목록
+       *
+       * ⚠️ 반드시 imageUrl 파일이 GitHub 저장소(root)에 존재해야 합니다.
+       * ⚠️ width/height를 실제 이미지 크기로 맞춰야 좌표가 정확합니다.
+       */
+      const PLANS = {
+        "B1F_A": {
+          imageUrl: "B1F_A.png",
+          width: 2000, height: 1200,
+          beams: [
+            { id: "B12", x: 820, y: 520, status: "출하완료" },
+            { id: "B13", x: 910, y: 540, status: "미출하" },
+            { id: "G07", x: 320, y: 260, status: "출하완료" },
+          ]
+        },
+        "B1F_B": {
+          imageUrl: "B1F_B.png",
+          width: 2000, height: 1200,
+          beams: [
+            { id: "B21", x: 600, y: 400, status: "미출하" },
+          ]
+        },
+        "1F_A": {
+          imageUrl: "1F_A.png",
+          width: 2000, height: 1200,
+          beams: [
+            { id: "A01", x: 1000, y: 600, status: "출하완료" },
+          ]
+        },
+        "1F_B": {
+          imageUrl: "1F_B.png",
+          width: 2000, height: 1200,
+          beams: [
+            { id: "B01", x: 450, y: 700, status: "미출하" },
+          ]
+        },
+      };
 
-      beams.forEach(b => {
-        const marker = L.circleMarker([b.y, b.x], { radius: 8 }).addTo(map);
-        marker.bindPopup(`<b>${b.id}</b><br/>상태: ${b.status}<br/><small>(${b.x}, ${b.y})</small>`);
+      function setActivePlanButton(planKey){
+        document.querySelectorAll(".floorbar button").forEach(btn => {
+          btn.classList.toggle("active", btn.dataset.plan === planKey);
+        });
+      }
+
+      function loadPlan(planKey){
+        const p = PLANS[planKey];
+        if(!p){
+          alert("플랜 정의가 없습니다: " + planKey);
+          return;
+        }
+
+        // 1) 도면 교체
+        if(overlay) map.removeLayer(overlay);
+        bounds = [[0, 0], [p.height, p.width]];
+        overlay = L.imageOverlay(p.imageUrl, bounds).addTo(map);
+        map.fitBounds(bounds);
+
+        // 2) 마커 교체
+        markerLayer.clearLayers();
+        markerById = new Map();
+
+        p.beams.forEach(b => {
+          const marker = L.circleMarker([b.y, b.x], { radius: 8 }).addTo(markerLayer);
+          marker.bindPopup(
+            `<b>부재번호:</b> ${b.id}<br/>` +
+            `<b>상태:</b> ${b.status}<br/>` +
+            `<small>좌표: (${b.x}, ${b.y})</small>`
+          );
+          markerById.set(String(b.id).trim().toUpperCase(), marker);
+        });
+
+        setActivePlanButton(planKey);
+      }
+
+      function focusBeam(idRaw){
+        const id = String(idRaw || "").trim().toUpperCase();
+        if(!id) return;
+
+        const marker = markerById.get(id);
+        if(!marker){
+          alert(`'${id}' 부재를 찾지 못했습니다.`);
+          return;
+        }
+        const latlng = marker.getLatLng();
+        map.setView(latlng, 0.5, { animate: true });  // 줌값은 0.5~1.5에서 취향대로 조정
+        marker.openPopup();
+      }
+
+      // 버튼 이벤트: 플랜 전환
+      document.querySelectorAll(".floorbar button").forEach(btn => {
+        btn.addEventListener("click", () => loadPlan(btn.dataset.plan));
       });
 
+      // 검색 이벤트
+      document.getElementById("beamSearchBtn").addEventListener("click", () => {
+        focusBeam(document.getElementById("beamSearch").value);
+      });
+      document.getElementById("beamSearch").addEventListener("keydown", (e) => {
+        if(e.key === "Enter") focusBeam(e.target.value);
+      });
+      document.getElementById("beamClearBtn").addEventListener("click", () => {
+        document.getElementById("beamSearch").value = "";
+        if(bounds) map.fitBounds(bounds);
+      });
+
+      // (디버그) 도면 클릭 시 좌표 출력: 핀 좌표 따기용
       map.on("click", (e) => {
         const x = Math.round(e.latlng.lng);
         const y = Math.round(e.latlng.lat);
         console.log("CLICK XY =", { x, y });
       });
+
+      // 최초 로딩 플랜
+      loadPlan("B1F_A");
     });
   </script>
 </body>
