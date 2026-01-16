@@ -6,14 +6,8 @@
   <title>층별 도면 - 부재 위치 맵</title>
 
   <!-- Leaflet CDN -->
-  <link
-    rel="stylesheet"
-    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-  />
-  <script
-    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    defer
-  ></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
 
   <style>
     html, body { height: 100%; margin: 0; }
@@ -26,6 +20,7 @@
       font-size: 14px;
       box-shadow: 0 2px 10px rgba(0,0,0,0.15);
       line-height: 1.25;
+      max-width: calc(100vw - 40px);
     }
 
     .searchbox{
@@ -34,6 +29,8 @@
       background: rgba(255,255,255,0.92); padding:8px 10px; border-radius:8px;
       box-shadow: 0 2px 10px rgba(0,0,0,0.15);
       font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      max-width: calc(100vw - 40px);
+      flex-wrap: wrap;
     }
     .searchbox input{
       width: 180px; padding: 6px 8px; border:1px solid #ccc; border-radius:6px;
@@ -45,7 +42,7 @@
     }
 
     .floorbar{
-      position:absolute; z-index:9999; left:10px; top:122px;
+      position:absolute; z-index:9999; left:10px; top:128px;
       display:flex; flex-wrap:wrap; gap:6px;
       background: rgba(255,255,255,0.92); padding:8px 10px; border-radius:8px;
       box-shadow: 0 2px 10px rgba(0,0,0,0.15);
@@ -60,7 +57,19 @@
       font-weight:600;
     }
 
-    /* 모바일에서 UI가 너무 커지지 않게 */
+    .legend{
+      position:absolute; z-index:9999; left:10px; bottom:10px;
+      background: rgba(255,255,255,0.92); padding:8px 10px; border-radius:8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      font-size: 13px;
+      display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+      max-width: calc(100vw - 40px);
+    }
+    .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+    .dot.done { background:#16a34a; } /* 초록 */
+    .dot.todo { background:#dc2626; } /* 빨강 */
+
     @media (max-width: 480px){
       .searchbox input{ width: 140px; }
       .hint{ font-size: 13px; }
@@ -72,17 +81,19 @@
   <div class="hint">
     📌 도면 드래그/확대 가능<br/>
     🔎 부재번호 검색 (예: B12) → 위치로 이동<br/>
+    🔄 시트 갱신 버튼으로 좌표/상태 최신 반영<br/>
     (디버그) 도면 클릭 시 좌표가 콘솔에 출력됩니다.
   </div>
 
-  <!-- 검색 UI -->
+  <!-- 검색 + 갱신 UI -->
   <div class="searchbox">
     <input id="beamSearch" type="text" placeholder="부재번호 검색 (예: B12)" />
     <button id="beamSearchBtn">찾기</button>
     <button id="beamClearBtn">초기화</button>
+    <button id="refreshBtn" title="구글시트 다시 읽기">시트갱신</button>
   </div>
 
-  <!-- 층/동 선택 UI -->
+  <!-- 층/동 선택 UI (표시명은 원하는 대로) -->
   <div class="floorbar">
     <button data-plan="B1F_A">B1F-A동</button>
     <button data-plan="B1F_B">B1F-B동</button>
@@ -90,10 +101,20 @@
     <button data-plan="1F_B">1F-B동</button>
   </div>
 
+  <div class="legend">
+    <span><span class="dot done"></span>출하완료(Y)</span>
+    <span><span class="dot todo"></span>미출하(N)</span>
+    <span id="countLabel">-</span>
+  </div>
+
   <div id="map"></div>
 
   <script>
     window.addEventListener("load", () => {
+      // ✅ 사용자 제공 CSV URL
+      const CSV_URL =
+        "https://docs.google.com/spreadsheets/d/e/2PACX-1vTIVHYKFpIvq87dpVFvo_81ExKssGZ4oXdcc4pxAliO7DWs4RUYd-i3RVNtrjLZA-6IlUiimktgxR_I/pub?gid=0&single=true&output=csv";
+
       // 지도(도면) 초기화
       const map = L.map("map", {
         crs: L.CRS.Simple,
@@ -106,66 +127,148 @@
       // 도면 오버레이/마커 레이어를 교체 가능하게 관리
       let overlay = null;
       const markerLayer = L.layerGroup().addTo(map);
-      let markerById = new Map();
+      let markerById = new Map();     // 현재 plan의 id -> marker
       let bounds = null;
+      let currentPlanKey = "B1F_A";
 
       /**
        * ✅ 플랜(층-동) 정의
-       * - imageUrl: GitHub에 올린 도면 이미지 파일명
+       * - imageUrl: GitHub에 올린 도면 이미지 파일명 (저장소 root에 있어야 함)
        * - width/height: 해당 이미지 실제 픽셀 크기
-       * - beams: {id, x, y, status} 목록
+       * - beams: 구글시트에서 로드되어 자동 채움
        *
-       * ⚠️ 반드시 imageUrl 파일이 GitHub 저장소(root)에 존재해야 합니다.
-       * ⚠️ width/height를 실제 이미지 크기로 맞춰야 좌표가 정확합니다.
+       * ⚠️ 아래 imageUrl/width/height는 반드시 실제 파일/크기에 맞게 수정하세요.
        */
       const PLANS = {
-        "B1F_A": {
-          imageUrl: "B1F_A.png",
-          width: 2000, height: 1200,
-          beams: [
-            { id: "B12", x: 820, y: 520, status: "출하완료" },
-            { id: "B13", x: 910, y: 540, status: "미출하" },
-            { id: "G07", x: 320, y: 260, status: "출하완료" },
-          ]
-        },
-        "B1F_B": {
-          imageUrl: "B1F_B.png",
-          width: 2000, height: 1200,
-          beams: [
-            { id: "B21", x: 600, y: 400, status: "미출하" },
-          ]
-        },
-        "1F_A": {
-          imageUrl: "1F_A.png",
-          width: 2000, height: 1200,
-          beams: [
-            { id: "A01", x: 1000, y: 600, status: "출하완료" },
-          ]
-        },
-        "1F_B": {
-          imageUrl: "1F_B.png",
-          width: 2000, height: 1200,
-          beams: [
-            { id: "B01", x: 450, y: 700, status: "미출하" },
-          ]
-        },
+        "B1F_A": { imageUrl: "B1F_A.png", width: 2000, height: 1200, beams: [] },
+        "B1F_B": { imageUrl: "B1F_B.png", width: 2000, height: 1200, beams: [] },
+        "1F_A":  { imageUrl: "1F_A.png",  width: 2000, height: 1200, beams: [] },
+        "1F_B":  { imageUrl: "1F_B.png",  width: 2000, height: 1200, beams: [] },
       };
 
-      function setActivePlanButton(planKey){
+      // ---------------------------
+      // CSV 파서(따옴표 포함 기본 대응)
+      // ---------------------------
+      function parseCSVLine(line) {
+        const out = [];
+        let cur = "";
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (ch === '"') {
+            // "" -> "
+            if (inQuotes && line[i + 1] === '"') {
+              cur += '"';
+              i++;
+            } else {
+              inQuotes = !inQuotes;
+            }
+          } else if (ch === "," && !inQuotes) {
+            out.push(cur);
+            cur = "";
+          } else {
+            cur += ch;
+          }
+        }
+        out.push(cur);
+        return out.map(s => s.trim());
+      }
+
+      function parseCSV(text) {
+        const lines = text.replace(/\r/g, "").split("\n").filter(l => l.trim().length > 0);
+        if (lines.length < 2) return [];
+
+        const header = parseCSVLine(lines[0]).map(h => h.toLowerCase());
+        const idx = (name) => header.indexOf(name);
+
+        const iPlan = idx("plan");
+        const iId = idx("id");
+        const iX = idx("x");
+        const iY = idx("y");
+        const iStatus = idx("status");
+
+        if ([iPlan, iId, iX, iY, iStatus].some(v => v < 0)) {
+          throw new Error("CSV 헤더가 plan,id,x,y,status 인지 확인하세요.");
+        }
+
+        const rows = [];
+        for (let i = 1; i < lines.length; i++) {
+          const cols = parseCSVLine(lines[i]);
+          const plan = cols[iPlan] || "";
+          const id = cols[iId] || "";
+          const x = Number(cols[iX]);
+          const y = Number(cols[iY]);
+          const status = (cols[iStatus] || "").trim();
+
+          if (!plan || !id || Number.isNaN(x) || Number.isNaN(y)) continue;
+
+          rows.push({ plan, id, x, y, status });
+        }
+        return rows;
+      }
+
+      function normalizePlanKey(planRaw) {
+        // 시트 plan 값은 버튼 data-plan과 동일하게: B1F_A, 1F_B 형태를 권장
+        return String(planRaw || "").trim();
+      }
+
+      function isDoneStatus(statusRaw) {
+        const s = String(statusRaw || "").trim().toUpperCase();
+        // Y / YES / TRUE / 1 / 출하완료 도 허용
+        return (s === "Y" || s === "YES" || s === "TRUE" || s === "1" || s.includes("출하"));
+      }
+
+      async function loadBeamsFromSheet() {
+        const res = await fetch(CSV_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error("CSV 로드 실패: HTTP " + res.status);
+        const text = await res.text();
+        const rows = parseCSV(text);
+
+        // plan별 beams 초기화
+        Object.keys(PLANS).forEach(k => PLANS[k].beams = []);
+
+        // rows -> PLANS[plan].beams
+        rows.forEach(r => {
+          const planKey = normalizePlanKey(r.plan);
+          if (!PLANS[planKey]) return; // 정의되지 않은 plan은 무시
+
+          PLANS[planKey].beams.push({
+            id: r.id,
+            x: r.x,
+            y: r.y,
+            done: isDoneStatus(r.status)
+          });
+        });
+      }
+
+      // ---------------------------
+      // 지도 표시 로직
+      // ---------------------------
+      function setActivePlanButton(planKey) {
         document.querySelectorAll(".floorbar button").forEach(btn => {
           btn.classList.toggle("active", btn.dataset.plan === planKey);
         });
       }
 
-      function loadPlan(planKey){
+      function updateCountLabel(planKey) {
+        const beams = (PLANS[planKey] && PLANS[planKey].beams) ? PLANS[planKey].beams : [];
+        const total = beams.length;
+        const done = beams.filter(b => b.done).length;
+        const pct = total ? Math.round((done / total) * 100) : 0;
+        document.getElementById("countLabel").textContent =
+          `총 ${total} / 출하완료 ${done} (${pct}%)`;
+      }
+
+      function loadPlan(planKey) {
         const p = PLANS[planKey];
-        if(!p){
+        if (!p) {
           alert("플랜 정의가 없습니다: " + planKey);
           return;
         }
+        currentPlanKey = planKey;
 
         // 1) 도면 교체
-        if(overlay) map.removeLayer(overlay);
+        if (overlay) map.removeLayer(overlay);
         bounds = [[0, 0], [p.height, p.width]];
         overlay = L.imageOverlay(p.imageUrl, bounds).addTo(map);
         map.fitBounds(bounds);
@@ -174,59 +277,104 @@
         markerLayer.clearLayers();
         markerById = new Map();
 
-        p.beams.forEach(b => {
-          const marker = L.circleMarker([b.y, b.x], { radius: 8 }).addTo(markerLayer);
+        (p.beams || []).forEach(b => {
+          const color = b.done ? "#16a34a" : "#dc2626"; // 초록/빨강
+          const marker = L.circleMarker([b.y, b.x], {
+            radius: 7,
+            color: color,
+            fillColor: color,
+            fillOpacity: 0.85,
+            weight: 2
+          }).addTo(markerLayer);
+
           marker.bindPopup(
-            `<b>부재번호:</b> ${b.id}<br/>` +
-            `<b>상태:</b> ${b.status}<br/>` +
+            `<b>부재번호:</b> ${escapeHtml(b.id)}<br/>` +
+            `<b>출하상태:</b> ${b.done ? "출하완료" : "미출하"}<br/>` +
             `<small>좌표: (${b.x}, ${b.y})</small>`
           );
+
           markerById.set(String(b.id).trim().toUpperCase(), marker);
         });
 
         setActivePlanButton(planKey);
+        updateCountLabel(planKey);
       }
 
-      function focusBeam(idRaw){
+      function focusBeam(idRaw) {
         const id = String(idRaw || "").trim().toUpperCase();
-        if(!id) return;
+        if (!id) return;
 
         const marker = markerById.get(id);
-        if(!marker){
-          alert(`'${id}' 부재를 찾지 못했습니다.`);
+        if (!marker) {
+          alert(`현재 선택한 화면(${currentPlanKey})에서 '${id}' 부재를 찾지 못했습니다.`);
           return;
         }
         const latlng = marker.getLatLng();
-        map.setView(latlng, 0.5, { animate: true });  // 줌값은 0.5~1.5에서 취향대로 조정
+        map.setView(latlng, 0.8, { animate: true }); // 줌값은 0.5~1.5에서 조정
         marker.openPopup();
       }
 
-      // 버튼 이벤트: 플랜 전환
+      // XSS 방지용(팝업에 부재번호 넣을 때)
+      function escapeHtml(str) {
+        return String(str).replace(/[&<>"']/g, (m) => ({
+          "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+        }[m]));
+      }
+
+      // ---------------------------
+      // UI 이벤트
+      // ---------------------------
       document.querySelectorAll(".floorbar button").forEach(btn => {
         btn.addEventListener("click", () => loadPlan(btn.dataset.plan));
       });
 
-      // 검색 이벤트
       document.getElementById("beamSearchBtn").addEventListener("click", () => {
         focusBeam(document.getElementById("beamSearch").value);
       });
       document.getElementById("beamSearch").addEventListener("keydown", (e) => {
-        if(e.key === "Enter") focusBeam(e.target.value);
+        if (e.key === "Enter") focusBeam(e.target.value);
       });
       document.getElementById("beamClearBtn").addEventListener("click", () => {
         document.getElementById("beamSearch").value = "";
-        if(bounds) map.fitBounds(bounds);
+        if (bounds) map.fitBounds(bounds);
+      });
+
+      document.getElementById("refreshBtn").addEventListener("click", async () => {
+        try {
+          document.getElementById("refreshBtn").textContent = "갱신중...";
+          document.getElementById("refreshBtn").disabled = true;
+
+          await loadBeamsFromSheet();
+          loadPlan(currentPlanKey); // 현재 화면 유지한 채로 다시 그림
+        } catch (err) {
+          console.error(err);
+          alert("시트 갱신 실패: " + err.message);
+        } finally {
+          document.getElementById("refreshBtn").textContent = "시트갱신";
+          document.getElementById("refreshBtn").disabled = false;
+        }
       });
 
       // (디버그) 도면 클릭 시 좌표 출력: 핀 좌표 따기용
       map.on("click", (e) => {
         const x = Math.round(e.latlng.lng);
         const y = Math.round(e.latlng.lat);
-        console.log("CLICK XY =", { x, y });
+        console.log("CLICK XY =", { x, y, plan: currentPlanKey });
       });
 
-      // 최초 로딩 플랜
-      loadPlan("B1F_A");
+      // ---------------------------
+      // 최초 로딩: 시트 읽고 -> 기본 플랜 표시
+      // ---------------------------
+      (async () => {
+        try {
+          await loadBeamsFromSheet();
+        } catch (err) {
+          console.error(err);
+          alert("구글시트 연동 실패(도면은 표시되지만 핀은 없을 수 있음): " + err.message);
+        } finally {
+          loadPlan(currentPlanKey);
+        }
+      })();
     });
   </script>
 </body>
